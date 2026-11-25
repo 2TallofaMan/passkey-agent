@@ -1,0 +1,45 @@
+{
+  "summary": "I tested the backend with 16 pytest cases using a real P-256 signing client, and all 16 passed. They cover canonical-JSON and signature checks, rejection of unsigned requests, bad signatures, non-canonical bodies, extra fields and stale timestamps, the 3-phase rotation including idempotency and ACK purge, recovery auto-reject, step-up approve/deny/payload mismatch/missing UV, and the backup Tier2-then-Tier1 flow. All requested UI flows passed at 1280x860: onboarding (24 words, blur plus hold-to-reveal, wrong words rejected), vault enroll, rotate, sync and RP view, all 4 chaos crash points with reboot recovery, the 4-PASS chaos suite, all attack sims with approval sheets showing within about 1s, audit filters, self-tests, backup export reaching AUTO-SYNC ON, and wipe then restore from seed giving the same agentId and record (IN SYNC). Main open risk: there is no cross-tab rotation lock (HIGH). No deprecated Expo packages and no SafeAreaView issues were found.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "all signed POST/PUT", "issue": "No replay protection (nonce/jti) within the 600s window. A captured signed PUT /api/backup can be replayed to roll the backup back to an older ciphertext. A device restored after that would get a stale password and DESYNC. Fix: add a nonce or a per-agent monotonic timestamp."},
+      {"endpoint": "GET /api/rp/pending", "issue": "Response is unsigned. The client's hashVerified only proves the server payload is self-consistent, not that it is authentic. Acceptable for a mock."},
+      {"endpoint": "server.py startup/shutdown", "issue": "@app.on_event is deprecated in FastAPI. Use a lifespan handler."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Chaos terminal", "issue": "Log does not auto-scroll to the newest entries. After the crash runs, the view still showed the first lines while the latest output was off-screen.", "testID": "chaos-terminal", "priority": "low"}
+    ],
+    "integration_issues": [
+      {"flow": "Concurrent rotation from two tabs (same profile)", "issue": "The lock is in-memory per tab (this.locks), so two open tabs (or both schedulers at the 30-min mark) rotate the same domain at once. Reproduced: tab1 ended VERIFYING with PROOF_REJECTED, tab2 committed. It recovered after reload here, but in rotate() the phase-3 putRecord writes a stale in-memory rec. If that write lands after the other tab's commit, it overwrites the new active password with the old one, leading to DESYNC/lockout. Fix: navigator.locks.request(`rotate:${domain}`) around rotate/recover, or BroadcastChannel leader election for the scheduler.", "affected_testIDs": ["domain-rotate-btn-example-com", "domain-state-example-com"]},
+      {"flow": "BEFORE_ACK recovery", "issue": "agent.ts:451 swallows an ACK_PURGE failure (.catch(() => null)) and then clears pendingAckRotationId. If the device is offline at boot, the previous password stays on the RP indefinitely. tick() also never retries a pending ACK for IDLE records (only bootRecovery does).", "affected_testIDs": ["chaos-reboot-btn"]}
+    ],
+    "design_issues": [
+      {"screen": "Onboarding reveal", "issues": ["Seed words are always present in the DOM/accessibility tree; the blur overlay only hides them visually. Consider not rendering the words until hold-to-reveal."]},
+      {"screen": "Tier2 approval sheet", "issues": ["The slide-in animation briefly puts the buttons outside the viewport, so an immediate click fails. It worked after about 300ms. Cosmetic."]}
+    ],
+    "react_native_issues": []
+  },
+  "test_report_links": ["/app/backend/tests/test_credential_agent_rp.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "HIGH: Add a cross-tab per-domain mutex (navigator.locks) for rotate()/recoverRecord() and a single scheduler leader, and re-read the record from IDB before each phase write.",
+    "MEDIUM: In recoverRecord, keep pendingAckRotationId when ACK_PURGE fails, and retry pending ACKs in tick().",
+    "MEDIUM: Add replay protection (nonce, or reject timestamp <= last seen per agent) on signed endpoints, especially PUT /api/backup.",
+    "LOW: Auto-scroll the chaos terminal to the bottom; don't render seed words in the DOM until revealed; split agent.ts (805 lines) into modules; replace @app.on_event with lifespan."
+  ],
+  "critical_code_review_comments": [
+    "agent.ts is 805 lines (>700). Split it into rotation, recovery, policy and backup modules.",
+    "server.py: the HMAC proof key is the stored verifier itself, so anyone with RP DB read access can forge proofs. Fine for a mock; document it.",
+    "Simulator and account-view endpoints are unauthenticated, and ALLOW_SIMULATED_UV=true accepts {simulated:true}. Both must be off in any real deployment.",
+    "No deprecated Expo packages (expo-av, expo-barcode-scanner, expo-background-fetch) and no SafeAreaView issues were found."
+  ],
+  "updated_files": ["/app/backend/tests/test_credential_agent_rp.py (new)"],
+  "success_rate": {"backend": "100% (16/16)", "frontend": "100% of requested flows; 1 high-risk concurrency defect found in extra testing"},
+  "seed_data_creation": "Pytest created TEST_<uuid> agents/accounts/backups (domain test-example.com). There is no delete API and deleting by prefix is not allowed, so they were left in place. UI runs created 4 browser identities with example.com accounts in rp_agents/rp_accounts.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Use a new browser identity per browser_automation call (IndexedDB does not persist between calls). Confirm labels render uppercase ('WORD #12'), so use a case-insensitive regex. Wait about 300ms after tier2-approval-sheet appears before clicking (slide animation). Tabs: get_by_text('Chaos'|'Audit'|'Settings'|'Vault', exact=True). Run backend tests with EXPO_PUBLIC_BACKEND_URL exported from frontend/.env.",
+  "rca_of_issue": "Two-tab race: rotate() holds `rec` in memory from phase 1 and writes {...rec, rotationState:'VERIFYING'} in phase 3 without re-reading IDB. The lock is a per-instance Set, so another tab can commit in between and have its new active slot overwritten. Repro: open two tabs, click Rotate now in both at the same time; one tab ends VERIFYING with PROOF_REJECTED."
+}

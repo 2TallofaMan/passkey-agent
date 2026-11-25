@@ -1,30 +1,25 @@
-import { View, StyleSheet, Image } from "react-native";
+import { Redirect } from "expo-router";
+import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 
-const EXPO_PUBLIC_BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL;
+import { useAgent } from "@/src/agent/agent";
+import { colors, spacing } from "@/src/theme";
 
 export default function Index() {
-  console.log(EXPO_PUBLIC_BACKEND_URL, "EXPO_PUBLIC_BACKEND_URL");
-
+  const { status } = useAgent();
+  if (status === "ready") return <Redirect href="/(tabs)/vault" />;
+  if (status === "uninitialized") return <Redirect href="/onboarding" />;
   return (
-    <View style={styles.container}>
-      <Image
-        source={require("../assets/images/app-image.png")}
-        style={styles.image}
-      />
+    <View style={styles.c} testID="boot-screen">
+      {status === "unsupported" ? (
+        <Text style={styles.t}>This agent runs in a desktop or mobile web browser (needs WebCrypto + IndexedDB). Open the web preview.</Text>
+      ) : (
+        <ActivityIndicator color={colors.brandPrimary} />
+      )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: "#0c0c0c",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  image: {
-    width: "100%",
-    height: "100%",
-    resizeMode: "contain",
-  },
+  c: { flex: 1, backgroundColor: colors.surface, alignItems: "center", justifyContent: "center", padding: spacing.xl },
+  t: { color: colors.onSurface, textAlign: "center", fontSize: 15 },
 });
