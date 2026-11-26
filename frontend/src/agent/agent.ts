@@ -4,8 +4,18 @@ import { useSyncExternalStore } from "react";
 
 import { getRpKey, plain, resetRpKeyCache, RpError, signedGet, signedSend, WK } from "./api";
 import * as C from "./crypto";
+import { pwnedCount } from "./hibp";
 import { idbAll, idbDelete, idbGet, idbPut, idbWipe } from "./idb";
+import * as P from "./policy";
 import * as WA from "./webauthn";
+
+export type PhaseInfo = { domain: string; phase: string; step: number; total: number; pausedUntil: number | null };
+export type AwsCreds = { accessKeyId: string; secretAccessKey: string };
+export const AWS_DOMAIN = "aws.amazon.com";
+export const SERVICES = [
+  { domain: "northwind.bank", name: "Northwind Bank" },
+  { domain: "acmemail.io", name: "Acme Mail" },
+];
 
 export type RotationState = "IDLE" | "STAGED" | "VERIFYING" | "DESYNC";
 export type CrashPoint = "NONE" | "AFTER_STAGE" | "AFTER_REMOTE_UPDATE" | "AFTER_VERIFY" | "BEFORE_ACK";
@@ -28,6 +38,17 @@ export type DomainRecord = {
   trustedDeviceIdsJson: string;
   publicJwk: C.PublicJwk;
   rotationCount: number;
+  serviceName?: string;
+  username?: string;
+  credentialType?: P.CredentialType;
+  mode?: P.Mode | null;
+  opModes?: Partial<Record<P.Operation, P.Mode>>;
+  failureCount?: number;
+  reminderSince?: number | null;
+  custody?: "agent" | "user";
+  stagedAt?: number | null;
+  pendingDeleteKeyId?: string | null;
+  lastVerification?: string | null;
   lastError: string | null;
 };
 
@@ -39,7 +60,11 @@ export type Meta = {
   tier2: WA.Tier2Credential | null;
   backupSyncEnabled: boolean;
   lastBackupAt: number | null;
+  policy?: P.Policy;
+  slowMoSeconds?: number;
 };
+
+export type Metric = { sessionsRevoked?: number; targetsConfirmed?: number; recoveryMs?: number };
 
 export type AuditEvent = {
   id: string;
@@ -51,6 +76,7 @@ export type AuditEvent = {
   actor: string;
   detail: string;
   payloadSha256: string | null;
+  metric?: Metric;
 };
 
 export type ApprovalRequest = {
@@ -80,6 +106,11 @@ type Snapshot = {
   toast: { msg: string; kind: "info" | "success" | "error" } | null;
   allowSimulatedUV: boolean;
   lastTick: number;
+  decisions: P.Decision[];
+  phase: PhaseInfo | null;
+  lastChaos: { point: string; pass: boolean; detail: string }[] | null;
+  lastSelfTests: SelfTest[] | null;
+  online: boolean;
 };
 
 export class ChaosCrash extends Error {}
@@ -101,6 +132,11 @@ class Agent {
     toast: null,
     allowSimulatedUV: false,
     lastTick: 0,
+    decisions: [],
+    phase: null,
+    lastChaos: null,
+    lastSelfTests: null,
+    online: true,
   };
   private listeners = new Set<() => void>();
   private domainKeys = new Map<string, CryptoKey>();
@@ -185,8 +221,22 @@ class Agent {
   private startLoops() {
     this.timers.forEach(clearInterval);
     this.timers = [setInterval(() => this.tick(), TICK_MS), setInterval(() => this.pollChallenges(), 8000)];
+    if (typeof window !== "undefined" && !this.onlineBound) {
+      this.onlineBound = true;
+      window.addEventListener("online", () => {
+        this.set({ online: true });
+        this.term("Network back online: resuming any interrupted rotation");
+        this.tick();
+      });
+      window.addEventListener("offline", () => this.set({ online: false }));
+    }
     this.tick();
     this.pollChallenges();
+  }
+  private onlineBound = false;
+
+  agentSend(path: string, body: object, method: "POST" | "PUT" = "POST") {
+    return this.key("agent").then((k) => signedSend(method, path, body, this.agentId, k));
   }
 
   private stopLoops() {
@@ -407,14 +457,16 @@ class Agent {
         await this.putRecord(rec); // another tab already rotated; refresh our view
         return true;
       }
+      if (rec.credentialType === "aws_access_key") return await this.rotateAws(rec, crashAt, reason);
       const rotationId = crypto.randomUUID();
       this.term(`[${domain}] rotation ${rotationId.slice(0, 8)} start (${reason})`);
       // Phase 1: generate & stage (durable local commit, active untouched)
       pwd = C.randomPassword(64);
-      rec = { ...rec, slotStagedEncrypted: await C.seal(await this.key("vault"), pwd, SLOT_AAD(domain)), rotationState: "STAGED", rotationId, lastError: null };
+      rec = { ...rec, slotStagedEncrypted: await C.seal(await this.key("vault"), pwd, SLOT_AAD(domain)), rotationState: "STAGED", rotationId, lastError: null, stagedAt: Date.now() };
       await this.putRecord(rec);
       this.term(`[${domain}] phase 1 STAGE: staged slot committed, state=STAGED`);
       this.crash(crashAt, "AFTER_STAGE");
+      await this.slow(domain, "STAGE", 1);
       // Phase 2: remote update (signed UV=false)
       const verifier = await C.passwordVerifier(pwd, domain);
       const trusted: string[] = JSON.parse(rec.trustedDeviceIdsJson);
@@ -423,14 +475,20 @@ class Agent {
       });
       this.term(`[${domain}] phase 2 REMOTE UPDATE: RP accepted staged hash (signed 200)`);
       this.crash(crashAt, "AFTER_REMOTE_UPDATE");
+      await this.slow(domain, "REMOTE UPDATE", 2);
       // Phase 3: live verification
       rec = { ...rec, rotationState: "VERIFYING" };
       await this.putRecord(rec);
       const res = await this.verifyPhase(domain, rotationId, pwd, "VERIFY_AND_COMMIT");
       this.term(`[${domain}] phase 3 VERIFY: ${res.result}; preserved [${res.preservedSessions.join(", ")}] revoked [${res.revokedSessions.join(", ")}]`);
+      const evidence = await this.realSignIn(rec, pwd);
+      const view = await this.serverView(domain);
+      const confirmed = view.sessions.filter((x: any) => trusted.includes(x.deviceId) && !x.revoked).length;
+      this.term(`[${domain}] verified: ${evidence}; propagation: ${confirmed}/${trusted.length} trusted device sessions still active`);
       this.crash(crashAt, "AFTER_VERIFY");
+      await this.slow(domain, "VERIFY + PROPAGATE", 3);
       // Phase 4: commit & purge
-      rec = { ...rec, slotActiveEncrypted: rec.slotStagedEncrypted, slotStagedEncrypted: null, rotationState: "IDLE", rotationId: null, pendingAckRotationId: rotationId, lastRotatedEpoch: now(), rotationCount: rec.rotationCount + 1 };
+      rec = { ...rec, slotActiveEncrypted: rec.slotStagedEncrypted, slotStagedEncrypted: null, rotationState: "IDLE", rotationId: null, pendingAckRotationId: rotationId, lastRotatedEpoch: now(), rotationCount: rec.rotationCount + 1, failureCount: 0, stagedAt: null, lastVerification: evidence };
       await this.putRecord(rec);
       this.term(`[${domain}] phase 4 COMMIT: staged promoted to active, staged slot cleared`);
       this.crash(crashAt, "BEFORE_ACK");
@@ -440,7 +498,8 @@ class Agent {
       this.term(`[${domain}] ACK: previous password purged on RP. state=IDLE`);
       await this.audit({
         type: "PASSWORD_ROTATED", severity: "success", tier: 1, domain,
-        detail: `Rotation ${rotationId.slice(0, 8)} (${reason}). Revoked: ${res.revokedSessions.join(", ") || "none"}`,
+        detail: `Rotation ${rotationId.slice(0, 8)} (${reason}). Evidence: ${evidence}. Revoked: ${res.revokedSessions.join(", ") || "none"}`,
+        metric: { sessionsRevoked: res.revokedSessions.length, targetsConfirmed: confirmed },
       });
       this.syncBackup();
       return true;
@@ -449,16 +508,13 @@ class Agent {
         this.term(`[${domain}] !! ${e.message} - process terminated mid-rotation`);
         await this.audit({ type: "CHAOS_CRASH_INJECTED", severity: "warning", tier: 1, domain, detail: e.message });
       } else {
-        const rec = await this.readRecord(domain).catch(() => null);
-        if (rec) await this.putRecord({ ...rec, lastError: e.message });
-        this.term(`[${domain}] rotation error: ${e.message}`);
-        await this.audit({ type: "ROTATION_FAILED", severity: "error", tier: 1, domain, detail: e.message });
+        await this.recordFailure(domain, e.message);
       }
       return false;
     } finally {
       pwd?.fill(0);
       this.locks.delete(domain);
-      this.set({ busy: { ...this.snap.busy, [domain]: false } });
+      this.set({ busy: { ...this.snap.busy, [domain]: false }, phase: null });
       await this.refreshFingerprints();
     }
   }
@@ -471,6 +527,7 @@ class Agent {
     let active: Uint8Array | null = null;
     try {
       let rec = await this.readRecord(domain);
+      if (rec.credentialType === "aws_access_key") return await this.recoverAws(rec);
       if (rec.rotationState === "IDLE") {
         if (rec.pendingAckRotationId) {
           active = await this.openSlot(rec.slotActiveEncrypted, domain);
@@ -492,7 +549,7 @@ class Agent {
           await this.verifyPhase(domain, rid, staged, "ACK_PURGE");
           await this.putRecord({ ...rec, pendingAckRotationId: null });
           this.term(`[${domain}] recovery: SLOT_STAGED valid (${r.result}) -> promoted, dead active slot wiped, state=IDLE`);
-          await this.audit({ type: "CRASH_RECOVERY", severity: "success", tier: 1, domain, detail: `Kept STAGED slot (${r.result}); wiped stale active` });
+          await this.audit({ type: "CRASH_RECOVERY", severity: "success", tier: 1, domain, detail: `Kept STAGED slot (${r.result}); wiped stale active`, metric: { recoveryMs: this.recoveryMs(rec) } });
           return "KEPT_STAGED";
         } catch (e) {
           if (!(e instanceof RpError && e.status === 409)) throw e;
@@ -504,7 +561,7 @@ class Agent {
       if (probe.matchedSlot === "ACTIVE") {
         await this.putRecord({ ...rec, slotStagedEncrypted: null, rotationState: "IDLE", rotationId: null, lastError: null });
         this.term(`[${domain}] recovery: SLOT_ACTIVE valid -> dead staged slot wiped, state=IDLE`);
-        await this.audit({ type: "CRASH_RECOVERY", severity: "success", tier: 1, domain, detail: "Kept ACTIVE slot; wiped dead staged slot" });
+        await this.audit({ type: "CRASH_RECOVERY", severity: "success", tier: 1, domain, detail: "Kept ACTIVE slot; wiped dead staged slot", metric: { recoveryMs: this.recoveryMs(rec) } });
         return "KEPT_ACTIVE";
       }
       await this.putRecord({ ...rec, rotationState: "DESYNC", lastError: "Neither slot verifies against RP" });

@@ -1,6 +1,9 @@
 // Minimal IndexedDB wrapper. CryptoKey objects are stored via structured clone, staying non-extractable.
 // Each put resolves only after the transaction commits (durable write, like a synchronous SQLite commit).
-const DB_NAME = "credential-agent";
+// Guest sandboxes use their own database (?sandbox=guest-xxxx) so presenter data is never touched.
+const sandboxParam = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("sandbox") : null;
+export const SANDBOX = sandboxParam && /^[a-z0-9-]{3,40}$/.test(sandboxParam) ? sandboxParam : null;
+const DB_NAME = SANDBOX ? `credential-agent-${SANDBOX}` : "credential-agent";
 const STORES = ["keys", "records", "audit", "meta"] as const;
 export type StoreName = (typeof STORES)[number];
 

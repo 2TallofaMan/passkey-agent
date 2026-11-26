@@ -26,7 +26,14 @@ from fastapi import APIRouter, FastAPI, Query, Request
 from fastapi.responses import Response
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, ConfigDict, ValidationError
+from datetime import datetime, timezone
+
 from pymongo import ASCENDING, IndexModel
+from pymongo.errors import DuplicateKeyError
+
+from aws_connector import dependent_loop, make_router as make_aws_router
+from docs_content import DOCS
+from pdfs import render_pdf
 from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
@@ -50,6 +57,10 @@ INDEXES: dict[str, list[IndexModel]] = {
         IndexModel([("agentId", ASCENDING), ("status", ASCENDING)], name="agent_status"),
     ],
     "rp_backups": [IndexModel([("backupId", ASCENDING)], name="backupId", unique=True)],
+    "rp_replay": [
+        IndexModel([("sigHash", ASCENDING)], name="sigHash", unique=True),
+        IndexModel([("createdAt", ASCENDING)], name="ttl", expireAfterSeconds=MAX_SKEW * 2),
+    ],
 }
 
 
@@ -145,6 +156,14 @@ async def read_signed(request: Request, model: type[BaseModel]):
     sig = request.headers.get("X-Agent-Signature")
     if not agent_id or not sig:
         raise RpErr(401, "MISSING_SIGNATURE", "X-Agent-Id and X-Agent-Signature are required")
+    domain = parsed.get("domain") if isinstance(parsed, dict) else None
+    if domain and await db.svc_status.find_one({"domain": domain, "outage": True}):
+        raise RpErr(503, "SERVICE_OUTAGE", f"{domain} is offline")
+    # Replay blocking: a given signed request can be accepted only once.
+    try:
+        await db.rp_replay.insert_one({"sigHash": hashlib.sha256(sig.encode() + raw).hexdigest(), "createdAt": datetime.now(timezone.utc)})
+    except DuplicateKeyError:
+        raise RpErr(409, "REPLAY_BLOCKED", "This signed request was already used")
     return body, parsed, agent_id, sig, raw
 
 
@@ -255,6 +274,7 @@ class Tier2Register(Strict):
 
 class Enroll(Strict):
     domain: str
+    username: str
     publicKeyJwk: Jwk
     initialPasswordHash: str
     trustedDevices: List[str]
@@ -405,7 +425,7 @@ async def enroll(request: Request):
     sessions = [{"deviceId": d, "trusted": True, "revoked": False, "createdAt": now()} for d in body.trustedDevices]
     sessions.append({"deviceId": "unknown-chromebook-7f3a", "trusted": False, "revoked": False, "createdAt": now()})
     doc = {
-        "agentId": agent_id, "domain": body.domain, "publicJwk": jwk,
+        "agentId": agent_id, "domain": body.domain, "username": body.username, "publicJwk": jwk, "passwordChangedAt": now(),
         "activeVerifier": body.initialPasswordHash, "previousVerifier": None, "stagedVerifier": None,
         "stagedRotationId": None, "lastCommittedRotationId": None, "preserve": body.trustedDevices,
         "sessions": sessions, "rotations": 0, "updatedAt": now(),
@@ -463,7 +483,7 @@ async def rotate_verify(request: Request):
         await db.rp_accounts.update_one(q, {"$set": {
             "previousVerifier": None if body.purgePreviousSlot else acct["activeVerifier"],
             "activeVerifier": acct["stagedVerifier"], "stagedVerifier": None, "stagedRotationId": None,
-            "lastCommittedRotationId": body.rotationId, "sessions": acct["sessions"],
+            "lastCommittedRotationId": body.rotationId, "sessions": acct["sessions"], "passwordChangedAt": now(),
             "rotations": acct.get("rotations", 0) + 1, "updatedAt": now(),
         }})
         return await signed({"result": "COMMITTED", "domain": body.domain, "rotationId": body.rotationId,
@@ -616,7 +636,200 @@ async def sim_rogue(req: SimSession):
     return {"result": "SESSION_CREATED", "deviceId": req.deviceId}
 
 
+class SvcLogin(BaseModel):
+    username: str
+    password: str
+    deviceId: str = "web-browser"
+
+
+class SvcChange(BaseModel):
+    username: str
+    currentPassword: str
+    newPassword: str
+
+
+class SvcOutage(BaseModel):
+    on: bool
+
+
+class NoticeAck(Strict):
+    domain: str
+    challengeId: str
+    decision: Literal["ROTATED", "ROTATION_QUEUED_FOR_APPROVAL", "REMINDER_SENT", "IGNORED"]
+    timestamp: int
+
+
+class UvVerify(Strict):
+    agentId: str
+    actionType: str
+    payloadSha256: str
+    assertion: dict
+    timestamp: int
+
+
+class ReportSign(BaseModel):
+    report: dict
+
+
+class ReportVerify(BaseModel):
+    report: dict
+    rpSignature: str
+
+
+def _pw_verifier_hex(password: str, domain: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), f"credential-agent:{domain}".encode(), 100000).hex()
+
+
+async def _svc_up(domain: str):
+    if await db.svc_status.find_one({"domain": domain, "outage": True}):
+        raise RpErr(503, "SERVICE_OUTAGE", f"{domain} is offline")
+
+
+# ------------------------------------------------ hosted demo services (real login, sessions, password change)
+@api.get("/svc/{domain}/info")
+async def svc_info(domain: str):
+    st = await db.svc_status.find_one({"domain": domain}, {"_id": 0})
+    n = await db.rp_accounts.count_documents({"domain": domain})
+    return {"domain": domain, "outage": bool(st and st.get("outage")), "accounts": n}
+
+
+@api.post("/svc/{domain}/admin/outage")
+async def svc_outage(domain: str, req: SvcOutage):
+    await db.svc_status.update_one({"domain": domain}, {"$set": {"outage": req.on, "at": now()}}, upsert=True)
+    return {"domain": domain, "outage": req.on}
+
+
+@api.post("/svc/{domain}/login")
+async def svc_login(domain: str, req: SvcLogin, request: Request):
+    await _svc_up(domain)
+    acct = await db.rp_accounts.find_one({"domain": domain, "username": req.username}, {"_id": 0})
+    v = acct and acct.get("activeVerifier")
+    if not v or not hmac.compare_digest(v.split("$")[2], _pw_verifier_hex(req.password, domain)):
+        raise RpErr(401, "INVALID_LOGIN", "Wrong username or password")
+    token = uuid.uuid4().hex
+    ip = (request.headers.get("x-forwarded-for") or (request.client.host if request.client else "")).split(",")[0].strip()
+    sess = {"deviceId": req.deviceId, "trusted": req.deviceId in (acct.get("preserve") or []), "revoked": False,
+            "createdAt": now(), "token": token, "ip": ip}
+    await db.rp_accounts.update_one({"domain": domain, "username": req.username}, {"$push": {"sessions": sess}})
+    return await signed({"result": "SIGNED_IN", "sessionToken": token, "username": req.username, "deviceId": req.deviceId})
+
+
+@api.post("/svc/{domain}/logout")
+async def svc_logout(domain: str, token: str = Query(...)):
+    await db.rp_accounts.update_one({"domain": domain, "sessions.token": token}, {"$set": {"sessions.$.revoked": True, "sessions.$.revokedAt": now()}})
+    return {"result": "SIGNED_OUT"}
+
+
+@api.get("/svc/{domain}/me")
+async def svc_me(domain: str, token: str = Query(...)):
+    await _svc_up(domain)
+    acct = await db.rp_accounts.find_one({"domain": domain, "sessions.token": token}, {"_id": 0})
+    if not acct:
+        raise RpErr(401, "NO_SESSION", "Session not found")
+    mine = next(s for s in acct["sessions"] if s.get("token") == token)
+    if mine["revoked"]:
+        raise RpErr(401, "SESSION_REVOKED", "This session was signed out")
+    return {"username": acct["username"], "domain": domain, "deviceId": mine["deviceId"], "passwordChangedAt": acct.get("passwordChangedAt"),
+            "agentPasskeyRegistered": True, "agentKeyX": acct["publicJwk"]["x"][:16],
+            "sessions": [{k: v for k, v in s.items() if k != "token"} for s in acct["sessions"]]}
+
+
+@api.post("/svc/{domain}/change-password")
+async def svc_change(domain: str, req: SvcChange):
+    await _svc_up(domain)
+    acct = await db.rp_accounts.find_one({"domain": domain, "username": req.username}, {"_id": 0})
+    if not acct or not hmac.compare_digest(acct["activeVerifier"].split("$")[2], _pw_verifier_hex(req.currentPassword, domain)):
+        raise RpErr(401, "INVALID_LOGIN", "Current password is wrong")
+    if len(req.newPassword) < 12:
+        raise RpErr(422, "WEAK_PASSWORD", "Use at least 12 characters")
+    await db.rp_accounts.update_one({"domain": domain, "username": req.username}, {"$set": {
+        "activeVerifier": f"pbkdf2-sha256$100000${_pw_verifier_hex(req.newPassword, domain)}", "passwordChangedAt": now(),
+        "lastManualChangeAt": now(), "previousVerifier": None, "stagedVerifier": None, "stagedRotationId": None}})
+    return {"result": "PASSWORD_CHANGED_BY_USER"}
+
+
+@api.get("/svc/{domain}/status")
+async def svc_status_view(domain: str, username: str = Query(...)):
+    acct = await db.rp_accounts.find_one({"domain": domain, "username": username}, {"_id": 0})
+    if not acct:
+        raise RpErr(404, "UNKNOWN_ACCOUNT", "Not enrolled")
+    st = await db.svc_status.find_one({"domain": domain}, {"_id": 0})
+    return {"passwordChangedAt": acct.get("passwordChangedAt"), "lastManualChangeAt": acct.get("lastManualChangeAt"),
+            "outage": bool(st and st.get("outage"))}
+
+
+@api.post("/rp/simulate/suspicious-login")
+async def sim_suspicious(req: SimReset):
+    cid = str(uuid.uuid4())
+    await db.rp_challenges.insert_one({"challengeId": cid, "agentId": req.agentId, "domain": req.domain, "kind": "NOTICE",
+                                       "reason": "SUSPICIOUS_LOGIN", "status": "PENDING", "requestOriginIp": req.originIp,
+                                       "requestingDevice": req.deviceId, "createdAt": now()})
+    return {"kind": "NOTICE", "challengeId": cid}
+
+
+@api.post(WK + "/notice-ack")
+async def notice_ack(request: Request):
+    body, _, agent_id, sig, raw = await read_signed(request, NoticeAck)
+    await load_account(agent_id, body.domain, sig, raw)
+    res = await db.rp_challenges.update_one({"challengeId": body.challengeId, "agentId": agent_id, "kind": "NOTICE", "status": "PENDING"},
+                                            {"$set": {"status": body.decision, "resolvedAt": now()}})
+    if res.matched_count == 0:
+        raise RpErr(409, "ALREADY_RESOLVED", "Notice not pending")
+    return await signed({"result": "ACKNOWLEDGED", "decision": body.decision})
+
+
+@api.post(WK + "/uv-verify")
+async def uv_verify(request: Request):
+    body, _, agent_id, sig, raw = await read_signed(request, UvVerify)
+    agent = await load_agent(agent_id)
+    verify_raw(agent["publicJwk"], sig, raw)
+    uv = verify_webauthn(agent, body.assertion, bytes.fromhex(body.payloadSha256))
+    return await signed({"verified": True, "uvSource": uv, "actionType": body.actionType, "payloadSha256": body.payloadSha256})
+
+
+# ------------------------------------------------ signed test report
+@api.post("/report/sign")
+async def report_sign(req: ReportSign):
+    der = (await rp_key()).sign(canonical(req.report), ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der)
+    return {"rpSignature": b64u_enc(r.to_bytes(32, "big") + s.to_bytes(32, "big")), "signedAt": now()}
+
+
+@api.post("/report/verify")
+async def report_verify(req: ReportVerify):
+    try:
+        sig = b64u_dec(req.rpSignature)
+        der = encode_dss_signature(int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big"))
+        (await rp_key()).public_key().verify(der, canonical(req.report), ec.ECDSA(hashes.SHA256()))
+        return {"valid": True}
+    except (InvalidSignature, ValueError):
+        return {"valid": False}
+
+
+# ------------------------------------------------ patent documents
+@api.get("/docs")
+async def docs_list():
+    return {"docs": [{"id": k, "title": v[0]} for k, v in DOCS.items()]}
+
+
+@api.get("/docs/{doc_id}.pdf")
+async def doc_pdf(doc_id: str):
+    if doc_id not in DOCS:
+        raise RpErr(404, "NO_DOC", "Unknown document")
+    title, md = DOCS[doc_id]
+    pdf = await asyncio.to_thread(render_pdf, title, md)
+    return Response(pdf, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="Passtate-{doc_id}.pdf"'})
+
+
+@api.get("/docs/{doc_id}")
+async def doc_get(doc_id: str):
+    if doc_id not in DOCS:
+        raise RpErr(404, "NO_DOC", "Unknown document")
+    return {"id": doc_id, "title": DOCS[doc_id][0], "markdown": DOCS[doc_id][1]}
+
+
 app.include_router(api)
+app.include_router(make_aws_router(db, read_signed, signed, RpErr, load_agent, verify_raw, Strict))
 app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
                    expose_headers=["X-RP-Signature"])
 
@@ -624,11 +837,13 @@ app.add_middleware(CORSMiddleware, allow_credentials=True, allow_origins=["*"], 
 @app.on_event("startup")
 async def start_index_build():
     app.state.index_task = asyncio.create_task(ensure_indexes())
+    app.state.dep_task = asyncio.create_task(dependent_loop(db))
 
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
     app.state.index_task.cancel()
+    app.state.dep_task.cancel()
     with suppress(asyncio.CancelledError):
         await app.state.index_task
     client.close()
